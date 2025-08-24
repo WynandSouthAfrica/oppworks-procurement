@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: oppworks-procurement
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app.py --server.port=$PORT --server.address=0.0.0.0
+    autoDeploy: true
+    envVars:
+      - key: OPP_DATA_ROOT
+        value: /persist
+    disks:
+      - name: oppworks-data
+        mountPath: /persist
+        sizeGB: 10
