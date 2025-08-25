@@ -1,15 +1,18 @@
-# OppWorks Procurement App — v0.2-hosted
+# OppWorks Procurement App — v0.3-snapshots
 # Author: ChatGPT (Developer Hat)
 # Notes:
 # - Persistent storage via OPP_DATA_ROOT env var (e.g., /persist on Render).
 # - Creates per-project folders (Quote/Order/Delivery/Invoice).
 # - SQLite DB in ROOT/data/procurement.db
 # - PDF generation uses fpdf2 and optional brand logo.
+# - NEW: Document versioning + automatic snapshots + full ZIP backups.
 
 import os
 import io
 import json
 import sqlite3
+import zipfile
+import shutil
 from datetime import datetime, date
 from typing import Optional, Tuple
 
@@ -18,7 +21,7 @@ from fpdf import FPDF
 from PIL import Image
 import streamlit as st
 
-APP_VERSION = "v0.2-hosted"
+APP_VERSION = "v0.3-snapshots"
 
 # Storage roots (HOSTED-FRIENDLY)
 ROOT = os.environ.get("OPP_DATA_ROOT", os.path.abspath("."))
@@ -27,11 +30,13 @@ DB_PATH = os.path.join(DATA_DIR, "procurement.db")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 ASSETS_DIR = os.path.join(ROOT, "assets")
 DEFAULT_STORAGE_ROOT = os.path.join(ROOT, "OppWorks_Procurement")
+BACKUPS_DIR = os.path.join(ROOT, "backups")  # holds full ZIPs and per-document snapshot copies
 
 # Ensure paths exist
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(ASSETS_DIR, exist_ok=True)
 os.makedirs(DEFAULT_STORAGE_ROOT, exist_ok=True)
+os.makedirs(BACKUPS_DIR, exist_ok=True)
 
 # -----------------------------
 # Utilities
@@ -42,9 +47,11 @@ def get_conn():
     conn.row_factory = sqlite3.Row
     return conn
 
+
 def month_text_date(dt: date) -> str:
     # Day Month Year with month spelled out, e.g., 24 August 2025
     return dt.strftime("%d %B %Y")
+
 
 def load_config() -> dict:
     cfg = {
@@ -62,10 +69,12 @@ def load_config() -> dict:
             pass
     return cfg
 
+
 def save_config(cfg: dict):
     os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
+
 
 def ensure_tables():
     conn = get_conn()
@@ -144,18 +153,29 @@ def ensure_tables():
             doc_type TEXT NOT NULL, -- Quote / Order / Delivery / Invoice
             filename TEXT NOT NULL,
             saved_path TEXT NOT NULL,
-            uploaded_at TEXT NOT NULL,
-            FOREIGN KEY(purchase_id) REFERENCES purchases(id)
+            uploaded_at TEXT NOT NULL
         );
         """
     )
 
+    # Add versioning columns if missing
+    try:
+        cur.execute("ALTER TABLE documents ADD COLUMN version INTEGER DEFAULT 1")
+    except Exception:
+        pass
+    try:
+        cur.execute("ALTER TABLE documents ADD COLUMN is_current INTEGER DEFAULT 1")
+    except Exception:
+        pass
+
     conn.commit()
     conn.close()
+
 
 def ensure_project_folders(root_folder: str):
     for sub in ["Quote", "Order", "Delivery", "Invoice"]:
         os.makedirs(os.path.join(root_folder, sub), exist_ok=True)
+
 
 STATUS_ORDER = [
     ("rfq_sent_date", "RFQ Sent"),
@@ -167,6 +187,7 @@ STATUS_ORDER = [
     ("receipting_sent_date", "Sent for Receipting"),
 ]
 
+
 def derive_status(row: dict) -> str:
     # Returns the highest achieved status in the workflow
     last_status = "Not Started"
@@ -175,13 +196,32 @@ def derive_status(row: dict) -> str:
             last_status = label
     return last_status
 
-def save_uploaded_file(uploaded_file, dest_folder: str) -> Tuple[str, str]:
-    os.makedirs(dest_folder, exist_ok=True)
-    filename = uploaded_file.name
-    dest_path = os.path.join(dest_folder, filename)
+
+def next_version(purchase_id: int, doc_type: str) -> int:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COALESCE(MAX(version),0) FROM documents WHERE purchase_id=? AND doc_type=?",
+        (purchase_id, doc_type),
+    )
+    v = cur.fetchone()[0] or 0
+    conn.close()
+    return int(v) + 1
+
+
+def versioned_name(filename: str, version: int) -> str:
     base, ext = os.path.splitext(filename)
+    return f"{base}_v{version}{ext}"
+
+
+def save_uploaded_file(uploaded_file, dest_folder: str, version: int) -> Tuple[str, str]:
+    os.makedirs(dest_folder, exist_ok=True)
+    filename = versioned_name(uploaded_file.name, version)
+    dest_path = os.path.join(dest_folder, filename)
+    # ensure unique in case of duplicates
     i = 1
     while os.path.exists(dest_path):
+        base, ext = os.path.splitext(filename)
         filename = f"{base}_{i}{ext}"
         dest_path = os.path.join(dest_folder, filename)
         i += 1
@@ -189,9 +229,10 @@ def save_uploaded_file(uploaded_file, dest_folder: str) -> Tuple[str, str]:
         f.write(uploaded_file.getbuffer())
     return filename, dest_path
 
-def save_pasted_to_pdf(text: str, dest_folder: str, brand_logo_path: Optional[str]) -> Tuple[str, str]:
+
+def save_pasted_to_pdf(text: str, dest_folder: str, brand_logo_path: Optional[str], version: int) -> Tuple[str, str]:
     os.makedirs(dest_folder, exist_ok=True)
-    filename = f"Pasted_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+    filename = f"Pasted_v{version}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
     dest_path = os.path.join(dest_folder, filename)
 
     pdf = FPDF()
@@ -216,6 +257,33 @@ def save_pasted_to_pdf(text: str, dest_folder: str, brand_logo_path: Optional[st
     pdf.output(dest_path)
     return filename, dest_path
 
+
+def snapshot_document_copy(src_path: str, purchase_id: int, doc_type: str, version: int) -> str:
+    """Copies the saved file into backups/documents/... as a snapshot revision."""
+    dest_folder = os.path.join(BACKUPS_DIR, "documents", f"purchase_{purchase_id}", doc_type)
+    os.makedirs(dest_folder, exist_ok=True)
+    dest_file = os.path.join(dest_folder, f"v{version}_" + os.path.basename(src_path))
+    try:
+        shutil.copy2(src_path, dest_file)
+    except Exception:
+        # best-effort only
+        pass
+    return dest_file
+
+
+def create_full_zip_snapshot() -> str:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = os.path.join(BACKUPS_DIR, f"oppworks_snapshot_{ts}.zip")
+    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as z:
+        for root_dir in [DATA_DIR, DEFAULT_STORAGE_ROOT]:
+            for folder, _, files in os.walk(root_dir):
+                for file in files:
+                    full = os.path.join(folder, file)
+                    rel = os.path.relpath(full, ROOT)
+                    z.write(full, rel)
+    return out_path
+
+
 # -----------------------------
 # UI Helpers
 # -----------------------------
@@ -226,13 +294,15 @@ def currency_fmt(value: float, curr: str = "ZAR") -> str:
     except Exception:
         return f"{curr} {value}"
 
-def read_df(query: str, params: Tuple = ()):
+
+def read_df(query: str, params: Tuple = ()): 
     conn = get_conn()
     df = pd.read_sql_query(query, conn, params=params)
     conn.close()
     return df
 
-def exec_sql(query: str, params: Tuple = ()):
+
+def exec_sql(query: str, params: Tuple = ()): 
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(query, params)
@@ -240,6 +310,7 @@ def exec_sql(query: str, params: Tuple = ()):
     last_id = cur.lastrowid
     conn.close()
     return last_id
+
 
 # -----------------------------
 # Streamlit App
@@ -514,44 +585,79 @@ elif nav == "Documents":
         st.markdown("**Upload a file** *or* **Paste text to generate PDF**")
         uploaded = st.file_uploader("Upload PDF or any file", type=None)
         pasted_text = st.text_area("Paste text (optional) — will be saved as a PDF with logo")
-        do_save = st.button("Save Document")
+        do_save = st.button("Save Document (creates new revision)")
 
         if do_save:
             row = dfp[dfp["id"] == purchase_id].iloc[0]
             prj_root = row["prj_root"]
             dest_folder = os.path.join(prj_root, doc_type)
+            ver = next_version(int(purchase_id), doc_type)
 
             saved_any = False
+            new_doc_id = None
+            new_path = None
+            new_filename = None
+
             if uploaded is not None:
-                fname, fpath = save_uploaded_file(uploaded, dest_folder)
-                exec_sql(
-                    "INSERT INTO documents(purchase_id, doc_type, filename, saved_path, uploaded_at) VALUES(?,?,?,?,?)",
-                    (int(purchase_id), doc_type, fname, fpath, month_text_date(date.today())),
+                fname, fpath = save_uploaded_file(uploaded, dest_folder, ver)
+                new_filename, new_path = fname, fpath
+                new_doc_id = exec_sql(
+                    "INSERT INTO documents(purchase_id, doc_type, filename, saved_path, uploaded_at, version, is_current) VALUES(?,?,?,?,?,?,?)",
+                    (int(purchase_id), doc_type, fname, fpath, month_text_date(date.today()), ver, 1),
                 )
-                st.success(f"File saved: {fpath}")
                 saved_any = True
 
             if pasted_text.strip():
-                fname, fpath = save_pasted_to_pdf(pasted_text, dest_folder, cfg.get("brand_logo_path"))
-                exec_sql(
-                    "INSERT INTO documents(purchase_id, doc_type, filename, saved_path, uploaded_at) VALUES(?,?,?,?,?)",
-                    (int(purchase_id), doc_type, fname, fpath, month_text_date(date.today())),
+                fname, fpath = save_pasted_to_pdf(pasted_text, dest_folder, cfg.get("brand_logo_path"), ver)
+                new_filename, new_path = fname, fpath
+                new_doc_id = exec_sql(
+                    "INSERT INTO documents(purchase_id, doc_type, filename, saved_path, uploaded_at, version, is_current) VALUES(?,?,?,?,?,?,?)",
+                    (int(purchase_id), doc_type, fname, fpath, month_text_date(date.today()), ver, 1),
                 )
-                st.success(f"Pasted text saved to PDF: {fpath}")
                 saved_any = True
+
+            if saved_any and new_doc_id:
+                # Mark previous versions as not current
+                conn = get_conn()
+                cur = conn.cursor()
+                cur.execute(
+                    "UPDATE documents SET is_current=0 WHERE purchase_id=? AND doc_type=? AND id<>?",
+                    (int(purchase_id), doc_type, int(new_doc_id)),
+                )
+                conn.commit()
+                conn.close()
+
+                # Snapshot copy
+                snapshot_document_copy(new_path, int(purchase_id), doc_type, ver)
+                st.success(f"Saved {doc_type} v{ver}: {new_filename}")
 
             if not saved_any:
                 st.warning("Nothing to save — upload a file or paste text.")
 
-        st.subheader("Recent Documents")
-        dfd = read_df(
+        st.subheader("Document History")
+        df_hist = read_df(
             """
-            SELECT d.id, d.purchase_id, d.doc_type, d.filename, d.saved_path, d.uploaded_at
-            FROM documents d
-            ORDER BY d.id DESC LIMIT 50
-            """
+            SELECT id, version, is_current, filename, saved_path, uploaded_at
+            FROM documents
+            WHERE purchase_id=? AND doc_type=?
+            ORDER BY version DESC, id DESC
+            """,
+            (int(purchase_id), doc_type),
         )
-        st.dataframe(dfd, use_container_width=True)
+        if df_hist.empty:
+            st.info("No documents yet for this purchase and type.")
+        else:
+            st.dataframe(df_hist, use_container_width=True)
+            # Download selected version
+            versions = [f"v{int(v)}{' (current)' if int(c)==1 else ''}" for v, c in zip(df_hist["version"], df_hist["is_current"])]
+            sel_idx = st.selectbox("Download a version", options=list(range(len(versions))), format_func=lambda i: versions[i])
+            if st.button("Download selected version"):
+                path = df_hist.iloc[sel_idx]["saved_path"]
+                try:
+                    with open(path, "rb") as f:
+                        st.download_button("Click to download", data=f.read(), file_name=os.path.basename(path), mime="application/octet-stream")
+                except Exception as e:
+                    st.error(f"Unable to read file: {e}")
 
 # -----------------------------
 # Reports
@@ -693,3 +799,23 @@ elif nav == "Settings":
 
     df_ap = read_df("SELECT id, name, role, limit_amount, created_at FROM approvers ORDER BY id DESC")
     st.dataframe(df_ap, use_container_width=True)
+
+    st.divider()
+    st.subheader("Snapshots & Backups")
+    c1, c2 = st.columns([1,1])
+    with c1:
+        if st.button("Create Full ZIP Snapshot Now"):
+            out_zip = create_full_zip_snapshot()
+            with open(out_zip, "rb") as f:
+                st.download_button("Download Snapshot ZIP", data=f.read(), file_name=os.path.basename(out_zip), mime="application/zip")
+    with c2:
+        snaps = [f for f in os.listdir(BACKUPS_DIR) if f.endswith('.zip')]
+        snaps.sort(reverse=True)
+        if snaps:
+            st.write("Recent snapshots:")
+            for s in snaps[:10]:
+                p = os.path.join(BACKUPS_DIR, s)
+                with open(p, "rb") as f:
+                    st.download_button(label=f"Download {s}", data=f.read(), file_name=s, mime="application/zip", key=f"dl_{s}")
+        else:
+            st.caption("No ZIP snapshots yet.")
