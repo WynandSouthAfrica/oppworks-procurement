@@ -1,16 +1,11 @@
-# OppWorks Procurement App — v0.4-pipeline
+# OppWorks Procurement App — v0.4.1-pipeline
 # Author: ChatGPT (Developer Hat)
 # Storage: uses OPP_DATA_ROOT (e.g., /persist on Render)
 # Snapshots: versioned documents + full ZIP backups
-# New in v0.4:
-# - Sidebar: Dashboard, Purchases + stage views, Suppliers, Projects, Documents, Reports,
-#            Approvers & Limits (moved), Settings
-# - Suppliers: description + “Generate Supplier PDF” saved to master folder
-# - Projects: extended fields (GL-Code, Operation Unit, Cost Centre, Misc, Partner, Approver)
-#             + “Generate Project PDF” saved to master folder
-# - Stage pages (Quote Received / Requisition Sent / Order Sent / Delivery / Invoice Signed / Sent for Receipting)
-#   for tracking each order; quick “Mark date today” and upload/paste document for that stage
-# - Documents: simple tracker + “missing steps” report
+# v0.4.1
+# - FIX: Stage pages caused a SyntaxError by breaking the if/elif chain.
+#        Split into a new chain after the helper function.
+# - No layout changes.
 
 import os, io, json, sqlite3, zipfile, shutil
 from datetime import datetime, date
@@ -20,7 +15,7 @@ import pandas as pd
 from fpdf import FPDF
 import streamlit as st
 
-APP_VERSION = "v0.4-pipeline"
+APP_VERSION = "v0.4.1-pipeline"
 
 # ---------- Paths ----------
 ROOT = os.environ.get("OPP_DATA_ROOT", os.path.abspath("."))
@@ -49,10 +44,9 @@ def ensure_tables():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
         company TEXT, email TEXT, phone TEXT,
-        desc TEXT,                -- NEW: description of goods/services
+        desc TEXT,
         created_at TEXT NOT NULL
     );""")
-    # safe ALTERs
     try: cur.execute("ALTER TABLE suppliers ADD COLUMN desc TEXT")
     except: pass
 
@@ -71,15 +65,14 @@ def ensure_tables():
         capex_code TEXT,
         cost_category TEXT,
         root_folder TEXT NOT NULL,
-        gl_code TEXT,             -- NEW
-        operation_unit TEXT,      -- NEW
-        cost_centre TEXT,         -- NEW
-        miscellaneous TEXT,       -- NEW
-        partner TEXT,             -- NEW
-        approver_id INTEGER,      -- NEW (FK to approvers)
+        gl_code TEXT,
+        operation_unit TEXT,
+        cost_centre TEXT,
+        miscellaneous TEXT,
+        partner TEXT,
+        approver_id INTEGER,
         created_at TEXT NOT NULL
     );""")
-    # safe ALTERs
     for col in ["gl_code","operation_unit","cost_centre","miscellaneous","partner","approver_id"]:
         try: cur.execute(f"ALTER TABLE projects ADD COLUMN {col} TEXT")
         except: pass
@@ -109,14 +102,13 @@ def ensure_tables():
     cur.execute("""CREATE TABLE IF NOT EXISTS documents(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         purchase_id INTEGER NOT NULL,
-        doc_type TEXT NOT NULL,    -- Quote / Order / Delivery / Invoice
+        doc_type TEXT NOT NULL,
         filename TEXT NOT NULL,
         saved_path TEXT NOT NULL,
         uploaded_at TEXT NOT NULL,
         version INTEGER DEFAULT 1,
         is_current INTEGER DEFAULT 1
     );""")
-    # safe ALTERs
     for col_def in ["version INTEGER DEFAULT 1","is_current INTEGER DEFAULT 1"]:
         try: cur.execute(f"ALTER TABLE documents ADD COLUMN {col_def}")
         except: pass
@@ -140,8 +132,7 @@ def month_text_date(dt: date) -> str:
 def load_config() -> dict:
     cfg = {"storage_root": DEFAULT_STORAGE_ROOT, "brand_logo_path": "", "currency":"ZAR", "vat_percent":15.0}
     if os.path.exists(CONFIG_PATH):
-        try:
-            cfg.update(json.load(open(CONFIG_PATH, "r", encoding="utf-8")))
+        try: cfg.update(json.load(open(CONFIG_PATH, "r", encoding="utf-8")))
         except: pass
     return cfg
 
@@ -169,15 +160,13 @@ def get_purchase_dict(pid:int)->dict:
     cur.execute("""SELECT rfq_sent_date,quote_received_date,requisition_requested_date,
                    order_sent_date,delivered_date,invoice_signed_date,receipting_sent_date
                    FROM purchases WHERE id=?""",(pid,))
-    r = cur.fetchone()
-    conn.close()
+    r = cur.fetchone(); conn.close()
     if not r: return {}
     cols = ["rfq_sent_date","quote_received_date","requisition_requested_date","order_sent_date","delivered_date","invoice_signed_date","receipting_sent_date"]
     return {k:r[i] for i,k in enumerate(cols)}
 
 def update_stage_date(pid:int, col:str, dt:date):
-    row = get_purchase_dict(pid)
-    row[col] = month_text_date(dt)
+    row = get_purchase_dict(pid); row[col] = month_text_date(dt)
     status = derive_status(row)
     exec_sql(f"UPDATE purchases SET {col}=?, status=? WHERE id=?", (row[col], status, pid))
     return status
@@ -242,8 +231,7 @@ def pdf_supplier_sheet(row, logo:str)->str:
     pdf.set_font("Arial","B",14); pdf.cell(0,10,"Supplier Summary",ln=True,align="R"); pdf.ln(6)
     pdf.set_font("Arial", size=11)
     def line(k,v): pdf.cell(45,8,f"{k}:",0); pdf.multi_cell(0,8,str(v or ""))
-    line("Company", row["company"]); line("Contact", row["name"])
-    line("Email", row["email"]); line("Phone", row["phone"])
+    line("Company", row["company"]); line("Contact", row["name"]) ; line("Email", row["email"]); line("Phone", row["phone"])
     pdf.ln(2); pdf.set_font("Arial","B",12); pdf.cell(0,8,"Goods/Services",ln=True)
     pdf.set_font("Arial", size=11); pdf.multi_cell(0,7,row["desc"] or "")
     pdf.ln(4); pdf.set_font("Arial", size=10); pdf.cell(0,8,f"Generated: {month_text_date(date.today())}",ln=True)
@@ -260,13 +248,7 @@ def pdf_project_sheet(proj, approver, logo:str)->str:
     pdf.set_font("Arial","B",14); pdf.cell(0,10,"Project Sheet",ln=True,align="R"); pdf.ln(6)
     pdf.set_font("Arial", size=11)
     def line(k,v): pdf.cell(45,8,f"{k}",0); pdf.cell(0,8,f"—  {v or ''}",ln=True)
-    line("Project name", proj["name"])
-    line("Location", proj["location"])
-    line("GL-Code", proj["gl_code"])
-    line("Operation Unit", proj["operation_unit"])
-    line("Cost Centre", proj["cost_centre"])
-    line("Miscellaneous", proj["miscellaneous"])
-    line("Partner", proj["partner"])
+    line("Project name", proj["name"]) ; line("Location", proj["location"]) ; line("GL-Code", proj["gl_code"]) ; line("Operation Unit", proj["operation_unit"]) ; line("Cost Centre", proj["cost_centre"]) ; line("Miscellaneous", proj["miscellaneous"]) ; line("Partner", proj["partner"]) ;
     appr_text = f"{approver['name']} ({approver['role']}, limit {approver['limit_amount']})" if approver else ""
     line("Approver", appr_text)
     pdf.ln(4); pdf.set_font("Arial", size=10); pdf.cell(0,8,f"Generated: {month_text_date(date.today())}",ln=True)
@@ -283,20 +265,7 @@ with st.sidebar:
     if cfg.get("brand_logo_path") and os.path.exists(cfg["brand_logo_path"]):
         st.image(cfg["brand_logo_path"], use_container_width=True)
     nav = st.radio("Navigation", [
-        "Dashboard",
-        "Purchases",
-        "Quote Received",
-        "Requisition Sent",
-        "Order Sent",
-        "Delivery / Invoice",
-        "Invoice Signed",
-        "Sent for Receipting",
-        "Suppliers",
-        "Projects",
-        "Documents",
-        "Reports",
-        "Approvers & Limits",
-        "Settings",
+        "Dashboard","Purchases","Quote Received","Requisition Sent","Order Sent","Delivery / Invoice","Invoice Signed","Sent for Receipting","Suppliers","Projects","Documents","Reports","Approvers & Limits","Settings"
     ], index=0)
 
 # ---------- Dashboard ----------
@@ -311,7 +280,7 @@ if nav == "Dashboard":
     c3.metric("Purchases", n_pur); c4.metric("Spend (excl VAT)", f"{cfg.get('currency','ZAR')} {total:,.2f}")
 
     st.subheader("Pipeline")
-    dfp = read_df("""SELECT status, COUNT(*) n FROM purchases GROUP BY status""")
+    dfp = read_df("SELECT status, COUNT(*) n FROM purchases GROUP BY status")
     st.dataframe(dfp, use_container_width=True)
 
     st.subheader("Missing Steps")
@@ -323,8 +292,9 @@ if nav == "Dashboard":
                      ORDER BY p.id DESC""")
     for col,_ in STATUS_ORDER:
         if col in dfm.columns:
-            dfm[f"{col}_missing"] = dfm[col].isna() | (dfm[col]=="") 
-    st.dataframe(dfm[[c for c in dfm.columns if "missing" in c] + ["id","project","supplier"]], use_container_width=True)
+            dfm[f"{col}_missing"] = dfm[col].isna() | (dfm[col]=="")
+    cols = ["id","project","supplier"] + [c for c in dfm.columns if c.endswith("_missing")]
+    st.dataframe(dfm[cols], use_container_width=True)
 
 # ---------- Suppliers ----------
 elif nav == "Suppliers":
@@ -366,14 +336,7 @@ elif nav == "Projects":
         st.subheader("Add Project")
         left, right = st.columns([1,2])
         with left:
-            st.write("Project name")
-            st.write("Location")
-            st.write("GL-Code")
-            st.write("Operation Unit")
-            st.write("Cost Centre")
-            st.write("Miscellaneous")
-            st.write("Partner")
-            st.write("Approver")
+            st.write("Project name"); st.write("Location"); st.write("GL-Code"); st.write("Operation Unit"); st.write("Cost Centre"); st.write("Miscellaneous"); st.write("Partner"); st.write("Approver")
         with right:
             name = st.text_input(" ", key="prj_name")
             location = st.selectbox(" ", ["Boksburg","Piet Retief","Ugie","Other"], index=0, key="prj_loc")
@@ -406,8 +369,7 @@ elif nav == "Projects":
     dfp = read_df("SELECT * FROM projects ORDER BY id DESC")
     st.dataframe(dfp[["id","name","location","gl_code","operation_unit","cost_centre","partner","approver_id","root_folder","created_at"]], use_container_width=True)
     if not dfp.empty:
-        pid = st.selectbox("Choose a project", options=dfp["id"].tolist(),
-                           format_func=lambda i: dfp.set_index("id").loc[i,"name"])
+        pid = st.selectbox("Choose a project", options=dfp["id"].tolist(), format_func=lambda i: dfp.set_index("id").loc[i,"name"])
         if st.button("Generate Project PDF in master folder"):
             proj = dict(dfp.set_index("id").loc[int(pid)])
             appr = None
@@ -441,15 +403,11 @@ elif nav == "Purchases":
             st.markdown("---")
             t1,t2,t3 = st.columns(3)
             with t1:
-                rfq = st.date_input("RFQ Sent", value=date.today())
-                quote = st.date_input("Quote Received")
+                rfq = st.date_input("RFQ Sent", value=date.today()); quote = st.date_input("Quote Received")
             with t2:
-                req = st.date_input("Requisition Requested")
-                order = st.date_input("Order Sent")
+                req = st.date_input("Requisition Requested"); order = st.date_input("Order Sent")
             with t3:
-                delivered = st.date_input("Delivered")
-                inv_signed = st.date_input("Invoice Signed")
-                recpt = st.date_input("Sent for Receipting")
+                delivered = st.date_input("Delivered"); inv_signed = st.date_input("Invoice Signed"); recpt = st.date_input("Sent for Receipting")
             go = st.form_submit_button("Save Purchase")
             if go:
                 row = {
@@ -476,14 +434,13 @@ elif nav == "Purchases":
                      ORDER BY p.id DESC""")
     st.dataframe(dfp, use_container_width=True)
 
-# ---------- Stage views ----------
+# ---------- Stage helper & pages ----------
 def stage_page(title:str, stage_col:str, stage_label:str, default_doc_type:str="Quote", allow_doc_choice:bool=False):
     st.header(title)
     df = read_df("""SELECT p.id, pj.name project, s.company supplier, p.item_description, p.amount_excl_vat, p.status
                     FROM purchases p JOIN projects pj ON pj.id=p.project_id JOIN suppliers s ON s.id=p.supplier_id
                     WHERE p.status=? ORDER BY p.id DESC""", (stage_label,))
-    st.subheader("Purchases at this stage")
-    st.dataframe(df, use_container_width=True)
+    st.subheader("Purchases at this stage"); st.dataframe(df, use_container_width=True)
     all_df = read_df("""SELECT p.id, pj.name project, s.company supplier, pj.root_folder prj_root
                         FROM purchases p JOIN projects pj ON pj.id=p.project_id JOIN suppliers s ON s.id=p.supplier_id
                         ORDER BY p.id DESC""")
@@ -511,27 +468,21 @@ def stage_page(title:str, stage_col:str, stage_label:str, default_doc_type:str="
             fname, fpath = save_text_pdf(pasted, dest, cfg.get("brand_logo_path"), v)
         doc_id = exec_sql("INSERT INTO documents(purchase_id,doc_type,filename,saved_path,uploaded_at,version,is_current) VALUES(?,?,?,?,?,?,1)",
                           (int(pid), dtype, fname, fpath, month_text_date(date.today()), v))
-        # mark previous non-current
-        exec_sql("UPDATE documents SET is_current=0 WHERE purchase_id=? AND doc_type=? AND id<>?",
-                 (int(pid), dtype, int(doc_id)))
+        exec_sql("UPDATE documents SET is_current=0 WHERE purchase_id=? AND doc_type=? AND id<>?", (int(pid), dtype, int(doc_id)))
         snapshot_copy(fpath, int(pid), dtype, v)
         st.success(f"Saved {dtype} v{v}: {fname}")
 
-elif nav == "Quote Received":
+# New chain (fixes SyntaxError)
+if nav == "Quote Received":
     stage_page("Quote Received", "quote_received_date", "Quote Received", default_doc_type="Quote")
-
 elif nav == "Requisition Sent":
     stage_page("Requisition Sent", "requisition_requested_date", "Requisition Requested", default_doc_type="Quote")
-
 elif nav == "Order Sent":
     stage_page("Order Sent", "order_sent_date", "Order Sent", default_doc_type="Order")
-
 elif nav == "Delivery / Invoice":
     stage_page("Delivery / Invoice", "delivered_date", "Delivered", default_doc_type="Delivery", allow_doc_choice=True)
-
 elif nav == "Invoice Signed":
     stage_page("Invoice Signed", "invoice_signed_date", "Invoice Signed", default_doc_type="Invoice")
-
 elif nav == "Sent for Receipting":
     stage_page("Sent for Receipting", "receipting_sent_date", "Sent for Receipting", default_doc_type="Invoice")
 
@@ -543,13 +494,12 @@ elif nav == "Documents":
                      p.delivered_date, p.invoice_signed_date, p.receipting_sent_date
                      FROM purchases p JOIN projects pj ON pj.id=p.project_id JOIN suppliers s ON s.id=p.supplier_id
                      ORDER BY p.id DESC""")
-    st.subheader("Per-purchase status dates")
-    st.dataframe(dfp, use_container_width=True)
+    st.subheader("Per-purchase status dates"); st.dataframe(dfp, use_container_width=True)
 
-    dfd = read_df("""SELECT d.purchase_id, d.doc_type, MAX(d.version) as latest_version, SUM(CASE WHEN is_current=1 THEN 1 ELSE 0 END) as current
+    dfd = read_df("""SELECT d.purchase_id, d.doc_type, MAX(d.version) as latest_version,
+                     SUM(CASE WHEN is_current=1 THEN 1 ELSE 0 END) as current
                      FROM documents d GROUP BY d.purchase_id, d.doc_type""")
-    st.subheader("Documents uploaded (latest version per type)")
-    st.dataframe(dfd, use_container_width=True)
+    st.subheader("Documents uploaded (latest version per type)"); st.dataframe(dfd, use_container_width=True)
 
 # ---------- Reports ----------
 elif nav == "Reports":
@@ -558,8 +508,7 @@ elif nav == "Reports":
     if df_prj.empty:
         st.warning("Add a project to view reports.")
     else:
-        pid = st.selectbox("Project", options=df_prj["id"].tolist(),
-                           format_func=lambda i: df_prj.set_index("id").loc[i,"name"])
+        pid = st.selectbox("Project", options=df_prj["id"].tolist(), format_func=lambda i: df_prj.set_index("id").loc[i,"name"])
         df = read_df("""SELECT p.id, s.company supplier, p.item_description, p.category,
                         p.amount_excl_vat, p.vat_percent, p.status
                         FROM purchases p JOIN suppliers s ON s.id=p.supplier_id
@@ -572,20 +521,16 @@ elif nav == "Reports":
         c1.metric("Total (excl)", f"{cfg.get('currency','ZAR')} {total_excl:,.2f}")
         c2.metric("VAT", f"{cfg.get('currency','ZAR')} {total_vat:,.2f}")
         c3.metric("Total (incl)", f"{cfg.get('currency','ZAR')} {total_incl:,.2f}")
-        st.download_button("Download CSV", data=df.to_csv(index=False).encode("utf-8"),
-                           file_name="project_purchases.csv", mime="text/csv")
+        st.download_button("Download CSV", data=df.to_csv(index=False).encode("utf-8"), file_name="project_purchases.csv", mime="text/csv")
 
 # ---------- Approvers & Limits ----------
 elif nav == "Approvers & Limits":
     st.header("Approvers & Limits")
     with st.form("add_app"):
-        n = st.text_input("Name")
-        r = st.text_input("Role")
-        lim = st.number_input("Limit Amount (excl)", min_value=0.0, step=1000.0)
+        n = st.text_input("Name"); r = st.text_input("Role"); lim = st.number_input("Limit Amount (excl)", min_value=0.0, step=1000.0)
         go = st.form_submit_button("Add Approver")
         if go and n:
-            exec_sql("INSERT INTO approvers(name,role,limit_amount,created_at) VALUES(?,?,?,?)",
-                     (n.strip(), r.strip(), float(lim), month_text_date(date.today())))
+            exec_sql("INSERT INTO approvers(name,role,limit_amount,created_at) VALUES(?,?,?,?)", (n.strip(), r.strip(), float(lim), month_text_date(date.today())))
             st.success("Approver saved.")
     dfa = read_df("SELECT id, name, role, limit_amount, created_at FROM approvers ORDER BY id DESC")
     st.dataframe(dfa, use_container_width=True)
@@ -602,8 +547,7 @@ elif nav == "Settings":
         st.caption("Brand Logo (PNG/JPG)")
         logo_file = st.file_uploader("Upload logo", type=["png","jpg","jpeg"])
         if st.button("Save Logo") and logo_file is not None:
-            ext=os.path.splitext(logo_file.name)[1].lower()
-            path=os.path.join(ASSETS_DIR, f"brand_logo{ext}")
+            ext=os.path.splitext(logo_file.name)[1].lower(); path=os.path.join(ASSETS_DIR, f"brand_logo{ext}")
             with open(path,"wb") as f: f.write(logo_file.getbuffer())
             cfg["brand_logo_path"]=path; save_config(cfg); st.success(f"Logo saved: {path}"); st.experimental_rerun()
 
@@ -613,15 +557,14 @@ elif nav == "Settings":
         cfg["vat_percent"] = float(vat)
         save_config(cfg); st.success("Settings saved.")
 
-    st.divider()
-    st.subheader("Snapshots & Backups")
-    c1,c2 = st.columns(2)
-    with c1:
+    st.divider(); st.subheader("Snapshots & Backups")
+    a,b = st.columns(2)
+    with a:
         if st.button("Create Full ZIP Snapshot Now"):
             out = full_zip_snapshot()
             with open(out,"rb") as f:
                 st.download_button("Download snapshot ZIP", data=f.read(), file_name=os.path.basename(out), mime="application/zip")
-    with c2:
+    with b:
         snaps=[f for f in os.listdir(BACKUPS_DIR) if f.endswith(".zip")]; snaps.sort(reverse=True)
         if snaps:
             st.write("Recent snapshots:")
