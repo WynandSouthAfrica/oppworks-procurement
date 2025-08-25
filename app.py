@@ -1,11 +1,10 @@
-# OppWorks Procurement App — v0.4.1-pipeline
+# OppWorks Procurement App — v0.4.2-pipeline
 # Author: ChatGPT (Developer Hat)
 # Storage: uses OPP_DATA_ROOT (e.g., /persist on Render)
 # Snapshots: versioned documents + full ZIP backups
-# v0.4.1
-# - FIX: Stage pages caused a SyntaxError by breaking the if/elif chain.
-#        Split into a new chain after the helper function.
-# - No layout changes.
+# v0.4.2
+# - Projects form polished: one clean, inline column (labels + inputs stacked) as requested.
+# - No layout changes elsewhere.
 
 import os, io, json, sqlite3, zipfile, shutil
 from datetime import datetime, date
@@ -15,7 +14,7 @@ import pandas as pd
 from fpdf import FPDF
 import streamlit as st
 
-APP_VERSION = "v0.4.1-pipeline"
+APP_VERSION = "v0.4.2-pipeline"
 
 # ---------- Paths ----------
 ROOT = os.environ.get("OPP_DATA_ROOT", os.path.abspath("."))
@@ -300,13 +299,10 @@ if nav == "Dashboard":
 elif nav == "Suppliers":
     st.header("Suppliers")
     with st.form("add_sup"):
-        c1,c2 = st.columns(2)
-        with c1:
-            name = st.text_input("Contact Name *")
-            company = st.text_input("Company")
-        with c2:
-            email = st.text_input("Email")
-            phone = st.text_input("Phone")
+        name = st.text_input("Contact Name *")
+        company = st.text_input("Company")
+        email = st.text_input("Email")
+        phone = st.text_input("Phone")
         desc = st.text_area("Goods/Services description")
         go = st.form_submit_button("Save Supplier")
         if go and name:
@@ -328,31 +324,24 @@ elif nav == "Suppliers":
             with open(out, "rb") as f:
                 st.download_button("Download now", data=f.read(), file_name=os.path.basename(out), mime="application/pdf")
 
-# ---------- Projects ----------
+# ---------- Projects (POLISHED INLINE FORM) ----------
 elif nav == "Projects":
     st.header("Projects")
     df_ap = read_df("SELECT id, name, role, limit_amount FROM approvers ORDER BY name")
     with st.form("add_prj"):
         st.subheader("Add Project")
-        left, right = st.columns([1,2])
-        with left:
-            st.write("Project name"); st.write("Location"); st.write("GL-Code"); st.write("Operation Unit"); st.write("Cost Centre"); st.write("Miscellaneous"); st.write("Partner"); st.write("Approver")
-        with right:
-            name = st.text_input(" ", key="prj_name")
-            location = st.selectbox(" ", ["Boksburg","Piet Retief","Ugie","Other"], index=0, key="prj_loc")
-            gl_code = st.text_input(" ", key="prj_gl")
-            operation_unit = st.text_input(" ", key="prj_opu")
-            cost_centre = st.text_input(" ", key="prj_cc")
-            miscellaneous = st.text_input(" ", key="prj_misc")
-            partner = st.text_input(" ", key="prj_partner")
-            appr_id = st.selectbox(" ", options=[None]+df_ap["id"].tolist(),
-                                   format_func=lambda i: "—" if i is None else f"{df_ap.set_index('id').loc[i,'name']} ({df_ap.set_index('id').loc[i,'role']})")
-        c1,c2 = st.columns(2)
-        with c1:
-            capex_code = st.text_input("CAPEX / Cost Code (optional)")
-            cost_category = st.selectbox("Cost Category", ["Capex","Goods","Services"], index=0)
-        with c2:
-            prj_root_override = st.text_input("Project Root Folder (leave blank for default)", value="")
+        name = st.text_input("Project name *")
+        location = st.selectbox("Location", ["Boksburg","Piet Retief","Ugie","Other"], index=0)
+        gl_code = st.text_input("GL-Code")
+        operation_unit = st.text_input("Operation Unit")
+        cost_centre = st.text_input("Cost Centre")
+        miscellaneous = st.text_input("Miscellaneous")
+        partner = st.text_input("Partner")
+        appr_id = st.selectbox("Approver", options=[None]+df_ap["id"].tolist(),
+                               format_func=lambda i: "—" if i is None else f"{df_ap.set_index('id').loc[i,'name']} ({df_ap.set_index('id').loc[i,'role']})")
+        capex_code = st.text_input("CAPEX / Cost Code (optional)")
+        cost_category = st.selectbox("Cost Category", ["Capex","Goods","Services"], index=0)
+        prj_root_override = st.text_input("Project Root Folder (leave blank for default)", value="")
         go = st.form_submit_button("Create Project & Folders")
         if go and name:
             base = prj_root_override.strip() or cfg.get("storage_root", DEFAULT_STORAGE_ROOT)
@@ -472,7 +461,7 @@ def stage_page(title:str, stage_col:str, stage_label:str, default_doc_type:str="
         snapshot_copy(fpath, int(pid), dtype, v)
         st.success(f"Saved {dtype} v{v}: {fname}")
 
-# New chain (fixes SyntaxError)
+# Stage chain
 if nav == "Quote Received":
     stage_page("Quote Received", "quote_received_date", "Quote Received", default_doc_type="Quote")
 elif nav == "Requisition Sent":
